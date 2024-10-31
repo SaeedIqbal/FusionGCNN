@@ -8,6 +8,7 @@ import numpy as np
 import os
 
 # ============================ Dataset and DataLoader ============================
+
 class ECGDataset(Dataset):
     def __init__(self, data_path, transform=None):
         self.data_path = data_path
@@ -15,7 +16,6 @@ class ECGDataset(Dataset):
         self.data, self.labels = self.load_data()
 
     def load_data(self):
-        # Assume data files are numpy arrays with features and labels
         data = []
         labels = []
         for file in os.listdir(self.data_path):
@@ -44,17 +44,23 @@ class DataBalancer:
         class_weights = class_weight.compute_class_weight('balanced', classes=np.unique(self.dataset.labels), y=self.dataset.labels)
         return torch.tensor(class_weights, dtype=torch.float)
 
+# ============================ GNN Model for Global Feature Extraction ============================
 
-# ============================ Base Models ============================
-
-class BaseModel(nn.Module):
-    def __init__(self):
-        super(BaseModel, self).__init__()
+class GNNModel(BaseModel):
+    def __init__(self, input_dim=128, hidden_dim=256, output_dim=128):
+        super(GNNModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+        self.attention = nn.Parameter(torch.FloatTensor(hidden_dim, 1))
 
     def forward(self, x):
-        raise NotImplementedError("Must be implemented by subclass")
+        x = self.relu(self.fc1(x))
+        x = torch.matmul(x, self.attention).squeeze(-1)
+        x = self.relu(self.fc2(x))
+        return x
 
-# ============================ SigNet ============================
+# ============================ SigNet for Local Spatial Feature Extraction ============================
 
 class SigNet(BaseModel):
     def __init__(self, input_channels=1, output_dim=128):
@@ -74,22 +80,30 @@ class SigNet(BaseModel):
         x = self.fc(x)
         return x
 
-# ============================ DualGCNN ============================
+# ============================ DualGCNN with Regularization ============================
 
 class DualGCNN(BaseModel):
-    def __init__(self, gnn, signet):
+    def __init__(self, gnn, signet, reg_lambda=0.01):
         super(DualGCNN, self).__init__()
         self.gnn = gnn
         self.signet = signet
+        self.reg_lambda = reg_lambda
+
+    def regularize_features(self, features):
+        l2_norm = torch.norm(features, p=2)
+        return features + self.reg_lambda * l2_norm
 
     def forward(self, x):
-        F_g = self.gnn(x)  # Global feature extraction with GNN
-        F_c = self.signet(x)  # Local feature extraction with SigNet
+        # Global feature extraction with GNN
+        F_g = self.gnn(x)
         
-        # Interchange features for refinement
-        F_g_prime = self.gnn(F_c)
-        F_c_prime = self.signet(F_g)
-        
+        # Local feature extraction with SigNet
+        F_c = self.signet(x)
+
+        # Interchange features and apply regularization
+        F_g_prime = self.gnn(self.regularize_features(F_c))
+        F_c_prime = self.signet(self.regularize_features(F_g))
+
         return F_g_prime, F_c_prime
 
 # ============================ FusionGCNN ============================
@@ -164,7 +178,7 @@ def main():
     data_path = '/home/phd/dataset/MITBIH/'
     batch_size = 32
     learning_rate = 0.001
-    num_epochs = 20
+    num_epochs = 100
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load dataset and DataLoader
@@ -175,7 +189,7 @@ def main():
 
     # Model components
     signet = SigNet()
-    gnn = SigNet()  # Placeholder for a proper GNN model
+    gnn = GNNModel()  # GNN model for global feature extraction
     dual_gcnn = DualGCNN(gnn, signet)
     fusion_gcnn = FusionGCNN(gnn, signet)
     classifier = Classifier()
